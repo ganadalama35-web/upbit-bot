@@ -1,98 +1,152 @@
-import pyupbit
 import time
-import datetime
-from dotenv import dotenv_values
+import pyupbit
+from dotenv import load_dotenv
+import os
+import requests
+import csv
+from datetime import datetime
 
-# API 키 읽기
-config = dotenv_values(".env")
+# 환경변수 로드
+load_dotenv()
 
-ACCESS_KEY = config.get("UPBIT_ACCESS_KEY")
-SECRET_KEY = config.get("UPBIT_SECRET_KEY")
+access = os.getenv("UPBIT_ACCESS_KEY")
+secret = os.getenv("UPBIT_SECRET_KEY")
 
-# 업비트 연결
-upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-# 목표가 계산
-def get_target_price(ticker, k):
-    df = pyupbit.get_ohlcv(ticker, interval="day", count=2)
+print(telegram_token)
+print(telegram_chat_id)
 
-    if df is None:
-        return None
+upbit = pyupbit.Upbit(access, secret)
 
-    target = df.iloc[0]['close'] + (
-        df.iloc[0]['high'] - df.iloc[0]['low']
-    ) * k
+tickers = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
 
-    return float(target)
+def get_rsi(df, period=14):
+    delta = df['close'].diff()
 
-# 현재가 조회
-def get_current_price(ticker):
-    price = pyupbit.get_current_price(ticker)
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
 
-    if price is None:
-        return None
+    gain = up.rolling(period).mean()
+    loss = down.rolling(period).mean()
 
-    return float(price)
+    rs = gain / loss
 
-print("자동매매 시작")
+    rsi = 100 - (100 / (1 + rs))
 
-ticker = "KRW-BTC"
-k = 0.5
+    return rsi.iloc[-1]
 
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+
+    data = {
+        "chat_id": telegram_chat_id,
+        "text": message
+    }
+
+    requests.post(url, data=data)
+
+
+def save_log(action, price, amount):
+    with open("trade_log.csv", "a", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+
+        writer.writerow([
+            datetime.now(),
+            action,
+            price,
+            amount
+        ])
+
+# 설정값
+BUY_AMOUNT = 10000
+last_buy_times = {}   
+BUY_COOLDOWN = 300
+is_buying = False
+TAKE_PROFIT = 1.03   # +3%
+STOP_LOSS = 0.97     # -3%
+
+send_telegram_message("자동매매 봇 시작")
 while True:
     try:
-        now = datetime.datetime.now()
+        # 현재가
+        for ticker in tickers:
 
-        target_price = get_target_price(ticker, k)
-        current_price = get_current_price(ticker)
+            current_price = pyupbit.get_current_price(ticker)
 
-        # 가격 조회 실패 방지
-        if target_price is None or current_price is None:
-            print("가격 조회 실패")
-            time.sleep(5)
-            continue
+            # OHLCV 데이터
+            df = pyupbit.get_ohlcv(ticker, interval="minute5", count=20)
 
-        # 잔고 조회
-        krw = float(upbit.get_balance("KRW") or 0)
-        btc = float(upbit.get_balance("BTC") or 0)
+            ma5 = df['close'].rolling(5).mean().iloc[-1]
+            ma20 = df['close'].rolling(20).mean().iloc[-1]
+            rsi = get_rsi(df)
+            volume = df['volume'].iloc[-1]
+            avg_volume = df['volume'].rolling(10).mean().iloc[-1]
 
-        print("---------------")
-        print("시간:", now)
-        print("현재가:", current_price)
-        print("목표가:", target_price)
-        print("KRW:", krw)
-        print("BTC:", btc)
+            # 잔고
+            krw = upbit.get_balance("KRW")
+            coin = ticker.split("-")[1]
 
-        # 매수 조건
-        if current_price > target_price:
-            if krw >= 5000:
-                if btc < 0.00001:
+            btc = upbit.get_balance(coin)
+            avg_buy_price = upbit.get_avg_buy_price(coin)
 
-                    print("매수 실행")
+            profit_rate = 0
 
-                    result = upbit.buy_market_order(
-                        ticker,
-                        5000
-                    )
+            if avg_buy_price > 0:
+                profit_rate = ((current_price - avg_buy_price) / avg_buy_price) * 100
 
-                    print(result)
+            print("=" * 40)
+            print("코인:", ticker)
+            print("현재가:", current_price)
+            print("5MA:", ma5)
+            print("20MA:", ma20)
+            print("RSI:", round(rsi, 2))
+            print("거래량:", round(volume))
+            print("KRW:", krw)
+            print("보유수량:", btc)
+            print("평균매수가:", avg_buy_price)
+            print("수익률:", round(profit_rate, 2), "%")
 
-        # 매도 조건
-        if btc > 0.00001:
+            # 매수 조건
+            current_time = time.time()
 
-            if now.hour == 8 and now.minute == 59:
+            if (
+                ma5 > ma20 and rsi < 35 and volume > avg_volume
+                and krw > BUY_AMOUNT
+                and btc == 0
+                and current_time - last_buy_times.get(ticker, 0) > BUY_COOLDOWN
+                and not is_buying
+            ):
+                is_buying = True
+                print("매수 실행")
+                send_telegram_message(f"매수 완료: {ticker} / 가격: {current_price}")
+                upbit.buy_market_order(ticker, BUY_AMOUNT)
+                save_log("BUY", current_price, BUY_AMOUNT)
+                last_buy_times[ticker] = current_time
+                is_buying = False
 
-                print("매도 실행")
-
-                result = upbit.sell_market_order(
-                    ticker,
-                    btc
+            # 익절 / 손절
+            if (
+                btc > 0
+                and (
+                    current_price >= avg_buy_price * TAKE_PROFIT
+                    or rsi > 70
                 )
+            ):
+                if current_price >= avg_buy_price * TAKE_PROFIT:
+                    print("익절 매도")
+                    send_telegram_message(f"익절 매도 완료 / 가격: {current_price}")
+                    upbit.sell_market_order(ticker, btc)
 
-                print(result)
+                elif current_price <= avg_buy_price * STOP_LOSS:
+                    print("손절 매도")
+                    upbit.sell_market_order(ticker, btc)
 
-        time.sleep(5)
+            time.sleep(10)
 
     except Exception as e:
-        print("오류:", e)
-        time.sleep(5)
+            print("에러:", e)
+            send_telegram_message(f"에러 발생: {e}")
+            time.sleep(10)
+        
